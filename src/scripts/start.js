@@ -220,7 +220,7 @@ async function start() {
         window.EDITOR = EDITOR;
 
         // Run EDITOR code for all plugins
-        const editorCode = EDITOR.gatherPluginsJavascript([ "EDITOR" ]);
+        const editorCode = await EDITOR.gatherPluginsJavascript([ "EDITOR" ]);
         (new Function(editorCode))();
     }
 }

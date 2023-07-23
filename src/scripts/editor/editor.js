@@ -203,7 +203,7 @@ function filterJavascriptByPurposes(sourceCode, purposes) {
 function getRunnableJavascriptForOnePlugin(event, purposes) {
     const configFields = event.fields.filter((field) => field.key !== "plugin");
     let configsJS;
-    if (purposes.includes("EDITOR")) {
+    if (purposes.includes("EDITOR") && event.id) {
         configsJS = `const CONFIG = EDITOR.createEditorPluginConfig(${event.id});`;
     } else {
         configsJS = `const CONFIG = { fields: ${JSON.stringify(configFields)} };`;
@@ -215,6 +215,30 @@ function getRunnableJavascriptForOnePlugin(event, purposes) {
         return "";
     }
     return `(function () {\n// PLUGINS CONFIG\n${configsJS}\n${pluginJS}\n})();\n`;
+}
+
+function parseOrNull(json) {
+    try {
+        return JSON.parse(json);
+    } catch {
+        return null;
+    }
+}
+
+function fieldsFromPluginCode(code) {
+    const regex = /\/\/!CONFIG\s+([\w-]+)\s+\(([\w-]+)\)\s*(.*)/g;
+    const fields = Array.from(code.matchAll(regex)).map(([, key, type, json]) => ({ key, type, data: parseOrNull(json)}));
+    return fields;
+}
+
+// https://stackoverflow.com/questions/24909102/is-it-possible-to-find-all-comments-in-a-html-document-and-wrap-them-in-a-div
+function forEachHtmlComment(todo) {
+    var x = document.evaluate('//comment()', document, null, XPathResult.ANY_TYPE, null),
+    comment = x.iterateNext();
+    while (comment) {
+        todo(comment.textContent);
+        comment = x.iterateNext();
+    }
 }
 
 class PaletteEditor {
@@ -600,20 +624,6 @@ class EventEditor {
             const editorCode = getRunnableJavascriptForOnePlugin({ id, fields }, [ "EDITOR" ]);
             new Function(editorCode)();
         });
-
-        function parseOrNull(json) {
-            try {
-                return JSON.parse(json);
-            } catch {
-                return null;
-            }
-        }
-
-        function fieldsFromPluginCode(code) {
-            const regex = /\/\/!CONFIG\s+([\w-]+)\s+\(([\w-]+)\)\s*(.*)/g;
-            const fields = Array.from(code.matchAll(regex)).map(([, key, type, json]) => ({ key, type, data: parseOrNull(json)}));
-            return fields;
-        }
 
         this.actions = {
             add: ui.action("add-event-field", () => this.addField()),
@@ -2417,12 +2427,80 @@ class BipsiEditor extends EventTarget {
         this.logTextElement.replaceChildren("> RESTARTING PLAYTEST\n");
     }
 
-    gatherPluginsJavascript(purposes) {
+    async gatherEmbeddedPlugins() {
+        const result = [];
+        const fileComments = [];
+        let deferFiles = true; // Files are asynchronously read, which messes with comment iteration.
+        const handleComment = async comment => {
+            const header = comment.match(/^\s*([a-zA-Z_]+)(?:\r?\n|[ \t]*([0-9]*)\r?\n)/);
+            if (!header) return;
+            switch (header[1]) {
+                case 'EMBEDDED_PLUGIN': {
+                    comment = comment.slice(header[0].length);
+                    const fields = [
+                        { key: "plugin-order", type: "json", data: parseInt(header[2]) || 0 },
+                        { key: "plugin", type: "javascript", data: comment },
+                        ...fieldsFromPluginCode(comment),
+                    ];
+                    result.push({ fields });
+                    break;
+                }
+                case 'EMBEDDED_PLUGIN_FILE': {
+                    if (deferFiles) {
+                        fileComments.push(comment);
+                        return;
+                    }
+                    comment = comment.slice(header[0].length);
+                    const fileContent = await new Promise(resolve => {
+                        try {
+                            let request = new XMLHttpRequest();
+                            request.open('GET', comment, true);
+                            request.onloadend = () => {
+                                resolve(request.status === 200 ? request.responseText : null);
+                            }
+                            request.send();
+                        }
+                        catch (e) {
+                            resolve(null);
+                        }
+                    });
+                    if (!fileContent) return;
+                    // Look for xml comments, signifying that this file is a plugin collection
+                    const commentRegex = /<!--([\S\s]*?)-->/g;
+                    let commentMatch = commentRegex.exec(fileContent);
+                    if (commentMatch) {
+                        do {
+                            await handleComment(commentMatch[1]);
+                        } while (commentMatch = commentRegex.exec(fileContent));
+                    } else {
+                        // No xml style comments, the file must be a basic plugin script
+                        const fields = [
+                            { key: "plugin-order", type: "json", data: parseInt(header[2]) || 0 },
+                            { key: "plugin", type: "javascript", data: fileContent },
+                            ...fieldsFromPluginCode(fileContent),
+                        ];
+                        result.push({ fields });
+                    }
+                    break;
+                }
+            }
+        };
+        window.forEachHtmlComment(handleComment);
+        deferFiles = false;
+        for (const comment of fileComments) {
+            await handleComment(comment);
+        }
+        return result;
+    }
+
+    async gatherPluginsJavascript(purposes) {
         const { data } = this.getSelections();
 
         const event = findEventByTag(data, "is-plugins");
         const events = findEventsByTag(data, "is-plugin");
         if (event) events.push(event);
+
+        events.push(...await this.gatherEmbeddedPlugins());
 
         function getPluginPriority(event) {
             return parseInt((FIELD(event, "plugin-order") ?? "0").toString(), 10);
@@ -2451,7 +2529,7 @@ class BipsiEditor extends EventTarget {
         ONE("#player", clone).hidden = false;
 
         // insert plugins
-        ONE("#plugins", clone).innerHTML = this.gatherPluginsJavascript(debug ? [ "PLAYBACK", "PLAYBACK_DEV" ] : [ "PLAYBACK" ]);
+        ONE("#plugins", clone).innerHTML = await this.gatherPluginsJavascript(debug ? [ "PLAYBACK", "PLAYBACK_DEV" ] : [ "PLAYBACK" ]);
 
         // replace loading screen
         try {
@@ -2518,7 +2596,7 @@ class BipsiEditor extends EventTarget {
         }
 
         // Run EDITOR code for all plugins
-        const editorCode = EDITOR.gatherPluginsJavascript([ "EDITOR" ]);
+        const editorCode = await EDITOR.gatherPluginsJavascript([ "EDITOR" ]);
         (new Function(editorCode))();
     } 
 
